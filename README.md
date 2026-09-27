@@ -26,6 +26,14 @@ python3 app.py --db ./data.db --port 8302
 
 - `participant`：参与者；`consent`：同意版本；`sample`：样本；`withdrawal`：撤回申请。
 
+## 撤回级联
+
+- 撤回申请`approve`后，申请中列出的样本立即标记：已借出(`on_loan`)转`pending_recall`(待召回)，在库(`stored`)转`pending_disposal`(待处置)。
+- `pending_recall`样本归还(`return`)时转为`pending_disposal`，不再回到`stored`。
+- 参与者存在已批准或已执行的撤回时，其样本的`loan`和`anonymize`会被拒绝，防止绕过撤回结果；从`pending_disposal`发起的`anonymize`/`destroy`属于处置路径，仍然允许。
+- 撤回申请`execute`时会合并申请中漏填的样本（该参与者名下所有在库/已借出样本），去重后逐份处置，保证一份样本只处置一次；处置结果写入撤回单的`data.disposal`。
+- 对同一撤回申请重复`execute`是幂等重放：直接返回首次执行记录的处置结果，不会重复处置。
+
 ## 主要接口
 
 - `GET /health`：健康检查。
