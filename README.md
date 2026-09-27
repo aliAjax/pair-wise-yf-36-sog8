@@ -26,6 +26,13 @@ python3 app.py --db ./data.db --port 8302
 
 - `participant`：参与者；`consent`：同意版本；`sample`：样本；`withdrawal`：撤回申请。
 
+## 撤回处置流程
+
+- 撤回申请批准时，申请中列出的样本：已借出的进入`pending_recall`（待召回），在库的进入`pending_disposal`（待处置）；待召回样本归还时自动转为`pending_disposal`。
+- 执行撤回时会合并该参与者申请中漏填的样本：在库与待处置样本被销毁，借出中的样本转入待召回；每份样本只处置一次，结果记录在撤回单的`disposal_result`中。
+- 重复执行同一撤回申请返回同一次处置结果，不会二次处置。
+- 参与者存在已批准或已执行的撤回申请时，其样本不可再借出或匿名化；`pending_disposal`样本可执行`destroy`。
+
 ## 主要接口
 
 - `GET /health`：健康检查。

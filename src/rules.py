@@ -30,24 +30,94 @@ def _validate_sample_store(actor, entity, data, lookup):
     return {"stored_at": "2026-09-24T00:00:00Z"}
 
 
+def _check_no_approved_withdrawal(entity, lookup, action):
+    participant_id = entity["data"].get("participant_id")
+    if not participant_id or lookup is None:
+        return
+    withdrawals = lookup("withdrawal", "participant_id", participant_id) or []
+    for withdrawal in withdrawals:
+        if withdrawal["status"] in ("approved", "executed"):
+            raise ValidationError(
+                "cannot %s: participant has an approved withdrawal" % action
+            )
+
+
+def _validate_sample_loan(actor, entity, data, lookup):
+    _check_no_approved_withdrawal(entity, lookup, "loan sample")
+
+
+def _validate_sample_anonymize(actor, entity, data, lookup):
+    _check_no_approved_withdrawal(entity, lookup, "anonymize sample")
+
+
+def _validate_sample_return(actor, entity, data, lookup):
+    if entity["status"] == "pending_recall":
+        return {"next_status": "pending_disposal"}
+    return {}
+
+
 def _validate_withdrawal_approve(actor, entity, data, lookup):
     samples = data.get("sample_ids") or []
     if len(set(samples)) != len(samples):
         raise ConflictError("sample_ids contains duplicates")
+    participant_id = entity["data"].get("participant_id")
     for sample_id in samples:
-        if not _find_one(lookup, "sample", "id", sample_id):
+        sample = _find_one(lookup, "sample", "id", sample_id)
+        if not sample:
             raise ValidationError("unknown sample: " + str(sample_id))
+        if participant_id and sample["data"].get("participant_id") != participant_id:
+            raise ValidationError(
+                "sample does not belong to the withdrawing participant: " + str(sample_id)
+            )
     return {"approved_by": actor.user_id}
 
 
+WITHDRAWAL_APPROVE_TARGETS = {"on_loan": "pending_recall", "stored": "pending_disposal"}
+WITHDRAWAL_EXECUTE_DESTROY = ("stored", "pending_disposal")
+WITHDRAWAL_EXECUTE_RECALL = ("on_loan", "pending_recall")
+
+
+def plan_withdrawal_approve(samples):
+    """Listed samples of an approved withdrawal enter the disposal flow."""
+    plan = []
+    for sample in samples:
+        target = WITHDRAWAL_APPROVE_TARGETS.get(sample["status"])
+        if target:
+            plan.append((sample, target))
+    return plan
+
+
+def plan_withdrawal_execute(samples):
+    """Dispose every affected sample once and build the disposal result.
+
+    Samples missing from the application are merged in here: in-stock samples
+    are destroyed, samples still on loan are marked pending_recall. Samples
+    already destroyed or anonymized are skipped so no sample is disposed twice.
+    """
+    plan = []
+    destroyed = []
+    pending_recall = []
+    for sample in samples:
+        status = sample["status"]
+        if status in WITHDRAWAL_EXECUTE_DESTROY:
+            plan.append((sample, "destroyed"))
+            destroyed.append(sample["id"])
+        elif status in WITHDRAWAL_EXECUTE_RECALL:
+            if status == "on_loan":
+                plan.append((sample, "pending_recall"))
+            pending_recall.append(sample["id"])
+    result = {"destroyed": sorted(destroyed), "pending_recall": sorted(pending_recall)}
+    return plan, result
+
+
 CUSTOM_CREATE = {'participant': _validate_participant, 'consent': _validate_consent}
-CUSTOM_TRANSITIONS = {('sample', 'store'): _validate_sample_store, ('withdrawal', 'approve'): _validate_withdrawal_approve}
+CUSTOM_TRANSITIONS = {('sample', 'store'): _validate_sample_store, ('sample', 'loan'): _validate_sample_loan, ('sample', 'return'): _validate_sample_return, ('sample', 'anonymize'): _validate_sample_anonymize, ('withdrawal', 'approve'): _validate_withdrawal_approve}
 
 
 class RuleEngine:
     ALIASES = {'participants': 'participant', 'consents': 'consent', 'samples': 'sample', 'withdrawals': 'withdrawal'}
     INITIAL_STATUS = {'participant': 'registered', 'consent': 'draft', 'sample': 'collected', 'withdrawal': 'requested'}
-    TRANSITIONS = {'participant': {'close_participant': (('registered',), 'closed')}, 'consent': {'activate': (('draft',), 'active'), 'supersede': (('active',), 'superseded'), 'withdraw': (('active',), 'withdrawn')}, 'sample': {'store': (('collected',), 'stored'), 'loan': (('stored',), 'on_loan'), 'return': (('on_loan',), 'stored'), 'anonymize': (('stored',), 'anonymized'), 'destroy': (('stored',), 'destroyed')}, 'withdrawal': {'approve': (('requested',), 'approved'), 'execute': (('approved',), 'executed')}}
+    TRANSITIONS = {'participant': {'close_participant': (('registered',), 'closed')}, 'consent': {'activate': (('draft',), 'active'), 'supersede': (('active',), 'superseded'), 'withdraw': (('active',), 'withdrawn')}, 'sample': {'store': (('collected',), 'stored'), 'loan': (('stored',), 'on_loan'), 'return': (('on_loan', 'pending_recall'), 'stored'), 'anonymize': (('stored',), 'anonymized'), 'destroy': (('stored', 'pending_disposal'), 'destroyed')}, 'withdrawal': {'approve': (('requested',), 'approved'), 'execute': (('approved',), 'executed')}}
     CREATE_REQUIRED = {'participant': ('name',), 'consent': ('participant_id', 'scope'), 'sample': ('participant_id', 'sample_code', 'collected_at'), 'withdrawal': ('participant_id', 'requested_at')}
     ACTION_REQUIRED = {('consent', 'activate'): ('scope', 'version', 'expires_at'), ('consent', 'supersede'): ('reason',), ('consent', 'withdraw'): ('reason',), ('sample', 'store'): ('freezer', 'position', 'consent_id'), ('sample', 'loan'): ('recipient', 'purpose', 'due_at'), ('sample', 'anonymize'): ('reason',), ('sample', 'destroy'): ('reason',), ('withdrawal', 'approve'): ('reason', 'sample_ids'), ('withdrawal', 'execute'): ('executed_at',)}
     CREATE_ROLES = {'participant': ('admin', 'biobank'), 'consent': ('admin', 'committee'), 'sample': ('admin', 'biobank'), 'withdrawal': ('admin', 'biobank')}
@@ -101,10 +171,10 @@ class RuleEngine:
         self._ensure_role(actor, allowed_roles)
         self._require(data, self.ACTION_REQUIRED.get((kind, action), ()))
         custom = CUSTOM_TRANSITIONS.get((kind, action))
-        extra = custom(actor, entity, data, lookup) if custom else {}
+        extra = dict(custom(actor, entity, data, lookup) or {}) if custom else {}
+        next_status = extra.pop("next_status", next_status)
         patch = dict(data)
-        if extra:
-            patch.update(extra)
+        patch.update(extra)
         return next_status, patch
 
 

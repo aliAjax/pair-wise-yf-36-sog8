@@ -2,7 +2,7 @@ from uuid import uuid4
 
 from .audit import AuditTrail
 from .domain import ConflictError, NotFoundError
-from .rules import RuleEngine
+from .rules import RuleEngine, plan_withdrawal_approve, plan_withdrawal_execute
 
 
 class DomainService:
@@ -41,13 +41,38 @@ class DomainService:
         entity = self.repository.get_entity(entity_id)
         if not entity:
             raise NotFoundError("entity not found: " + entity_id)
+        kind = self.rules.normalize_kind(entity["kind"])
+        if kind == "withdrawal" and action == "execute" and entity["status"] == "executed":
+            # Re-submitting the same withdrawal returns the recorded disposal
+            # result instead of disposing the samples a second time.
+            return entity
         expected = int(expected_version) if expected_version is not None else entity["version"]
         next_status, patch = self.rules.validate_transition(
             actor, entity, action, dict(data or {}), self._lookup
         )
+        cascade = []
+        if kind == "withdrawal" and action == "approve":
+            listed = [
+                self.repository.get_entity(sample_id)
+                for sample_id in patch.get("sample_ids", [])
+            ]
+            cascade = plan_withdrawal_approve([sample for sample in listed if sample])
+        elif kind == "withdrawal" and action == "execute":
+            samples = self._lookup(
+                "sample", "participant_id", entity["data"].get("participant_id")
+            )
+            cascade, disposal_result = plan_withdrawal_execute(samples)
+            patch["disposal_result"] = disposal_result
         merged = dict(entity["data"])
         merged.update(patch)
-        updated = self.repository.update_entity(entity_id, expected, next_status, merged)
+        updates = [(entity_id, expected, next_status, merged)]
+        for sample, target in cascade:
+            updates.append((sample["id"], sample["version"], target, dict(sample["data"])))
+        if len(updates) > 1:
+            self.repository.update_many(updates)
+            updated = self.repository.get_entity(entity_id)
+        else:
+            updated = self.repository.update_entity(entity_id, expected, next_status, merged)
         self.audit.record(
             entity_id,
             actor,
@@ -56,6 +81,15 @@ class DomainService:
             updated["status"],
             {"patch": patch},
         )
+        for sample, target in cascade:
+            self.audit.record(
+                sample["id"],
+                actor,
+                "withdrawal_" + action,
+                sample["status"],
+                target,
+                {"withdrawal_id": entity_id},
+            )
         return updated
 
     def get(self, entity_id):
